@@ -1,0 +1,136 @@
+local P, PS, HS, RS = game:GetService("Players"), game:GetService("PathfindingService"), game:GetService("HttpService"), game:GetService("ReplicatedStorage")
+local lp, run, loop, autoDep, depAmt, pts, idx = P.LocalPlayer, false, false, true, 1000, {}, 1
+local spd, delay, file = 16, 0.3, "AutoWalk_Config.json"
+
+local RF = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+local W = RF:CreateWindow({Name = "Auto Walk & Deposit", LoadingTitle = "Auto Walk", ConfigurationSaving = {Enabled = false}})
+
+local function getCash()
+    local c = 0
+    if lp:FindFirstChild("PlayerGui") then
+        for _, v in ipairs(lp.PlayerGui:GetDescendants()) do
+            if (v:IsA("TextLabel") or v:IsA("TextBox")) and v.Text:find("%$") then
+                local n = tonumber(v.Text:gsub("[^%d]", ""))
+                if n and n > c then c = n end
+            end
+        end
+    end
+    return c
+end
+
+local function deposit(amt)
+    pcall(function()
+        local atm = RS:WaitForChild("ATM", 3)
+        if atm and atm:FindFirstChild("CashTransaction") then
+            atm.CashTransaction:FireServer(amt, "Deposit")
+            RF:Notify({Title = "ฝากเงินแล้ว 💰", Content = "ฝากจำนวน " .. amt, Duration = 2})
+        end
+    end)
+end
+
+local function checkDep()
+    if autoDep and getCash() >= depAmt then
+        deposit(depAmt)
+        task.wait(1)
+    end
+end
+
+local function walk(pos)
+    local char = lp.Character or lp.CharacterAdded:Wait()
+    local hum, root = char:FindFirstChildOfClass("Humanoid"), char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root then return false end
+    hum.WalkSpeed = spd
+    local path = PS:CreatePath({AgentRadius = 2, AgentHeight = 5})
+    if pcall(function() path:ComputeAsync(root.Position, pos) end) and path.Status == Enum.PathStatus.Success then
+        for _, w in ipairs(path:GetWaypoints()) do
+            if not run then return false end
+            if w.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+            hum:MoveTo(w.Position)
+            if not hum.MoveToFinished:Wait() then return false end
+        end
+        return true
+    end
+    return false
+end
+
+local function triggerE(pos)
+    for _, v in ipairs(workspace:GetDescendants()) do
+        if v:IsA("ProximityPrompt") and v.Enabled and v.Parent:IsA("BasePart") then
+            if (v.Parent.Position - pos).Magnitude < 12 then
+                task.wait(delay)
+                if fireproximityprompt then fireproximityprompt(v) else v:InputHoldBegin() task.wait(0.5) v:InputHoldEnd() end
+                return
+            end
+        end
+    end
+end
+
+local function equip(slot)
+    if slot < 1 or slot > 9 then return end
+    local char, bp = lp.Character, lp:FindFirstChild("Backpack")
+    if char and bp and bp:GetChildren()[slot] then
+        char:FindFirstChildOfClass("Humanoid"):EquipTool(bp:GetChildren()[slot])
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if run then checkDep() end
+    end
+end)
+
+local function start()
+    if #pts == 0 then return end
+    task.spawn(function()
+        while run do
+            for i = idx, #pts do
+                if not run then break end
+                idx = i
+                local p = pts[i]
+                if walk(p.pos) and run then
+                    triggerE(p.pos)
+                    equip(p.slot)
+                    checkDep()
+                    task.wait(p.wait)
+                end
+            end
+            if not loop or not run then break end
+            idx = 1
+        end
+    end)
+end
+
+-- UI Setup
+local T1 = W:CreateTab("หลัก", 4483362458)
+local T2 = W:CreateTab("จุดพิกัด", 4483362458)
+local selSlot = 0
+
+T1:CreateToggle({Name = "วนซ้ำตลอด", CurrentValue = false, Callback = function(v) loop = v end})
+T1:CreateToggle({Name = "ฝากเงินออโต้", CurrentValue = true, Callback = function(v) autoDep = v end})
+T1:CreateInput({Name = "ขั้นต่ำฝากเงิน", PlaceholderText = "1000", Callback = function(t) depAmt = tonumber(t) or 1000 end})
+T1:CreateButton({Name = "▶ เริ่มทำงาน", Callback = function() if not run then run = true idx = 1 start() end end})
+T1:CreateButton({Name = "■ หยุดทำงาน", Callback = function() run = false end})
+
+T2:CreateDropdown({
+    Name = "สลับถือช่องหลังกด E",
+    Options = {"ไม่ถือ", "ช่อง 1", "ช่อง 2", "ช่อง 3", "ช่อง 4", "ช่อง 5"},
+    CurrentOption = {"ไม่ถือ"},
+    Callback = function(o)
+        local n = tonumber(o[1]:match("%d+"))
+        selSlot = n or 0
+    end
+})
+
+T2:CreateButton({
+    Name = "➕ เซฟจุดที่ยืนอยู่ทันที",
+    Callback = function()
+        local r = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+        if r then
+            table.insert(pts, {pos = r.Position, wait = 3, slot = selSlot})
+            RF:Notify({Title = "เซฟพิกัดแล้ว", Content = "รวมทั้งหมด " .. #pts .. " จุด", Duration = 2})
+        end
+    end
+})
+
+T2:CreateButton({Name = "🗑️ ลบพิกัดทั้งหมด", Callback = function() pts = {} RF:Notify({Title = "ลบสำเร็จ", Content = "ลบพิกัดทั้งหมดแล้ว", Duration = 2}) end})
