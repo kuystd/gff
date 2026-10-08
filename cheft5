@@ -1,0 +1,486 @@
+-- Services
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local running = false
+local loopEnabled = false
+local autoDepositEnabled = true
+local depositThreshold = 1000
+local points = {}
+local currentPointIndex = 1
+
+-- Settings
+local walkSpeed = 16
+local promptDelay = 0.3
+local customHoldTime = 0.5
+local overrideHoldDuration = false
+local fileName = "AutoWalk_Config.json"
+
+-- Load Rayfield UI
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local Window = Rayfield:CreateWindow({
+    Name = "ระบบเดินออโต้ + บันทึกตั้งค่า",
+    LoadingTitle = "สคริปต์เดินออโต้",
+    LoadingSubtitle = "รองรับการบันทึกและโหลดจุดพิกัด (Config)",
+    ConfigurationSaving = { Enabled = true, FolderName = "AutoWalkConfig", FileName = "Settings" },
+    KeySystem = false
+})
+
+--========================
+-- Helper Functions
+--========================
+
+local function notify(title, content, duration)
+    Rayfield:Notify({ Title = title, Content = content, Duration = duration or 2.5 })
+end
+
+-- อ่านค่าเงินจาก UI หน้าจอ ($) หรือ Leaderstats
+local function getPlayerCash()
+    local cashValue = 0
+
+    -- ค้นหาจาก UI บนหน้าจอ
+    local playerGui = player:FindFirstChild("PlayerGui")
+    if playerGui then
+        for _, gui in ipairs(playerGui:GetDescendants()) do
+            if gui:IsA("TextLabel") or gui:IsA("TextBox") then
+                local text = gui.Text
+                if text:find("%$") or text:lower():find("cash") or text:lower():find("money") then
+                    local num = tonumber(text:gsub("[^%d]", ""))
+                    if num and num > cashValue then
+                        cashValue = num
+                    end
+                end
+            end
+        end
+    end
+
+    -- ค้นหาจาก Stats ตัวละคร
+    local stats = player:FindFirstChild("leaderstats") or player:FindFirstChild("Data") or player:FindFirstChild("stats")
+    if stats then
+        for _, child in ipairs(stats:GetChildren()) do
+            local name = child.Name:lower()
+            if name:find("cash") or name:find("money") or name:find("dollar") or name:find("wallet") or name:find("coin") then
+                local num = tonumber(child.Value)
+                if num and num > cashValue then
+                    cashValue = num
+                end
+            end
+        end
+    end
+
+    return cashValue
+end
+
+-- ยิงส่งฝากเงิน ATM
+local function depositMoney(amount)
+    pcall(function()
+        local atmFolder = ReplicatedStorage:WaitForChild("ATM", 5)
+        if atmFolder then
+            local cashTransaction = atmFolder:WaitForChild("CashTransaction", 5)
+            if cashTransaction then
+                cashTransaction:FireServer(amount, "Deposit")
+                notify("ฝากเงินสำเร็จ 💰", string.format("ฝากเงินจำนวน %d เรียบร้อยแล้ว!", amount))
+            end
+        end
+    end)
+end
+
+local function checkAndDeposit()
+    if autoDepositEnabled and getPlayerCash() >= depositThreshold then
+        updateStatus(string.format("เงินครบ %d -> กำลังฝากเงิน...", depositThreshold))
+        depositMoney(depositThreshold)
+        task.wait(1)
+    end
+end
+
+local function applyWalkSpeed(humanoid)
+    if humanoid then humanoid.WalkSpeed = walkSpeed end
+end
+
+local function equipSlot(slotNumber)
+    if not slotNumber or slotNumber < 1 or slotNumber > 9 then return end
+    
+    local character = player.Character
+    local backpack = player:FindFirstChild("Backpack")
+    if character and backpack then
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        local items = backpack:GetChildren()
+        if humanoid and items[slotNumber] and items[slotNumber]:IsA("Tool") then
+            humanoid:EquipTool(items[slotNumber])
+        end
+    end
+end
+
+local function walkTo(position)
+    local character = player.Character or player.CharacterAdded:Wait()
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+
+    if not humanoid or not root then return false end
+
+    applyWalkSpeed(humanoid)
+
+    local path = PathfindingService:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })
+    local success = pcall(function() path:ComputeAsync(root.Position, position) end)
+
+    if not success or path.Status ~= Enum.PathStatus.Success then return false end
+
+    for _, waypoint in ipairs(path:GetWaypoints()) do
+        if not running then return false end
+        applyWalkSpeed(humanoid)
+
+        if waypoint.Action == Enum.PathWaypointAction.Jump then
+            humanoid.Jump = true
+        end
+
+        humanoid:MoveTo(waypoint.Position)
+        if not humanoid.MoveToFinished:Wait() then return false end
+    end
+
+    humanoid:MoveTo(root.Position)
+    return true
+end
+
+local function findAndTriggerPrompt(position)
+    local nearest, nearestDistance = nil, 12
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") and obj.Enabled and obj.Parent and obj.Parent:IsA("BasePart") then
+            local distance = (obj.Parent.Position - position).Magnitude
+            if distance < nearestDistance then
+                nearestDistance = distance
+                nearest = obj
+            end
+        end
+    end
+
+    if nearest then
+        task.wait(promptDelay)
+        local holdTime = overrideHoldDuration and customHoldTime or (nearest.HoldDuration > 0 and (nearest.HoldDuration + 0.1) or 0.1)
+
+        if fireproximityprompt then
+            fireproximityprompt(nearest)
+        else
+            nearest:InputHoldBegin()
+            task.wait(holdTime)
+            nearest:InputHoldEnd()
+        end
+        return nearest
+    end
+    return nil
+end
+
+-- เช็คเงินเบื้องหลังตลอดเวลา
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if running and autoDepositEnabled and getPlayerCash() >= depositThreshold then
+            depositMoney(depositThreshold)
+            task.wait(2)
+        end
+    end
+end)
+
+--========================
+-- Save / Load Config
+--========================
+
+local function saveConfig()
+    if not writefile then
+        return notify("ผิดพลาด", "ไม่รองรับการเซฟไฟล์ (writefile)", 3)
+    end
+
+    local pointsList = {}
+    for _, p in ipairs(points) do
+        table.insert(pointsList, { x = p.position.X, y = p.position.Y, z = p.position.Z, waitTime = p.waitTime, slot = p.slot })
+    end
+
+    local saveData = {
+        walkSpeed = walkSpeed,
+        promptDelay = promptDelay,
+        customHoldTime = customHoldTime,
+        overrideHoldDuration = overrideHoldDuration,
+        autoDepositEnabled = autoDepositEnabled,
+        depositThreshold = depositThreshold,
+        pointsList = pointsList
+    }
+
+    writefile(fileName, HttpService:JSONEncode(saveData))
+    notify("บันทึกสำเร็จ", string.format("บันทึกจุดพิกัด %d จุดลงไฟล์เรียบร้อย!", #points), 3)
+end
+
+local function loadConfig()
+    if not readfile or not isfile or not isfile(fileName) then
+        return notify("แจ้งเตือน", "ไม่พบไฟล์บันทึกตั้งค่าที่เคยเซฟไว้", 3)
+    end
+
+    local success, result = pcall(function()
+        return HttpService:JSONDecode(readfile(fileName))
+    end)
+
+    if success and result then
+        walkSpeed = result.walkSpeed or walkSpeed
+        promptDelay = result.promptDelay or promptDelay
+        customHoldTime = result.customHoldTime or customHoldTime
+        overrideHoldDuration = result.overrideHoldDuration or false
+        depositThreshold = result.depositThreshold or depositThreshold
+        if result.autoDepositEnabled ~= nil then autoDepositEnabled = result.autoDepositEnabled end
+
+        points = {}
+        if result.pointsList then
+            for _, p in ipairs(result.pointsList) do
+                table.insert(points, { position = Vector3.new(p.x, p.y, p.z), waitTime = p.waitTime or 3, slot = p.slot or 0 })
+            end
+        end
+
+        updateStatus("โหลดข้อมูลตั้งค่าสำเร็จ")
+        notify("โหลดสำเร็จ", string.format("โหลดจุดพิกัดเรียบร้อย (%d จุด)", #points), 3)
+    end
+end
+
+--========================
+-- Main Execution Loop
+--========================
+
+local function startWorking()
+    if #points == 0 then return end
+
+    task.spawn(function()
+        local loopCount = 1
+
+        while running do
+            for i = currentPointIndex, #points do
+                if not running then break end
+                currentPointIndex = i
+
+                local loopInfo = loopEnabled and string.format(" (รอบที่ %d)", loopCount) or ""
+                updateStatus("กำลังเดินไปจุดที่ " .. i .. loopInfo)
+
+                if walkTo(points[i].position) and running then
+                    updateStatus("ถึงจุดที่ " .. i .. " - กำลังกดปุ่ม E...")
+
+                    local prompt = findAndTriggerPrompt(points[i].position)
+                    if prompt then
+                        notify("พบปุ่มกด", "กดปุ่ม: " .. prompt.Parent.Name, 1.5)
+                    end
+
+                    task.wait(0.2)
+
+                    if points[i].slot and points[i].slot > 0 then
+                        equipSlot(points[i].slot)
+                        updateStatus("ถือไอเทมช่องที่ " .. points[i].slot)
+                    end
+
+                    checkAndDeposit()
+                    task.wait(points[i].waitTime)
+                elseif running then
+                    updateStatus("เดินไปจุดที่ " .. i .. " ไม่สำเร็จ (ข้ามจุด)")
+                    task.wait(1)
+                end
+            end
+
+            if not loopEnabled or not running then break end
+            currentPointIndex = 1
+            loopCount = loopCount + 1
+            task.wait(0.5)
+        end
+
+        if not running then updateStatus("หยุดการทำงานแล้ว") end
+    end)
+end
+
+-- ตัวละครเกิดใหม่
+player.CharacterAdded:Connect(function(char)
+    local hum = char:WaitForChild("Humanoid", 10)
+    if hum then
+        applyWalkSpeed(hum)
+        if running and #points > 0 then
+            task.wait(2)
+            startWorking()
+        end
+        hum.Died:Connect(function()
+            if running then updateStatus("ตัวละครตาย - รอเกิดใหม่เพื่อทำงานต่อ...") end
+        end)
+    end
+end)
+
+--========================
+-- UI Elements
+--========================
+
+local MainTab = Window:CreateTab("หน้าหลัก", 4483362458)
+local ConfigTab = Window:CreateTab("ตั้งค่าตัวละคร/การกด", 4483362458)
+local SettingsTab = Window:CreateTab("จุดพิกัด", 4483362458)
+local SaveTab = Window:CreateTab("บันทึกตั้งค่า", 4483362458)
+
+local tempX, tempY, tempZ = 0, 0, 0
+local tempWait = 3
+local selectedSlot = 0
+
+local StatusParagraph = MainTab:CreateParagraph({
+    Title = "สถานะระบบ",
+    Content = "สถานะ: พร้อมทำงาน | จุดทั้งหมด: 0 จุด | วนซ้ำ: ปิด"
+})
+
+function updateStatus(msg)
+    StatusParagraph:Set({
+        Title = "สถานะระบบ",
+        Content = string.format("สถานะ: %s | จุดทั้งหมด: %d จุด | วนซ้ำ: %s", msg, #points, loopEnabled and "เปิด" or "ปิด")
+    })
+end
+
+MainTab:CreateSection("ควบคุมการทำงาน")
+
+MainTab:CreateToggle({
+    Name = "🔁 เดินวนซ้ำไม่จำกัด (Loop Infinity)",
+    CurrentValue = false,
+    Callback = function(Value)
+        loopEnabled = Value
+        updateStatus(running and "กำลังทำงาน..." or "พร้อมทำงาน")
+    end,
+})
+
+MainTab:CreateToggle({
+    Name = "💰 ฝากเงินอัตโนมัติเมื่อเงินครบกำหนด",
+    CurrentValue = true,
+    Callback = function(Value) autoDepositEnabled = Value end,
+})
+
+MainTab:CreateInput({
+    Name = "💵 กำหนดจำนวนเงินขั้นต่ำที่ต้องการฝาก",
+    PlaceholderText = "1000",
+    Callback = function(Text) depositThreshold = tonumber(Text) or 1000 end,
+})
+
+MainTab:CreateButton({
+    Name = "▶ เริ่มทำงาน (START)",
+    Callback = function()
+        if running then return notify("แจ้งเตือน", "ระบบกำลังทำงานอยู่แล้ว!", 3) end
+        if #points == 0 then return notify("แจ้งเตือน", "กรุณาเพิ่มจุดพิกัดอย่างน้อย 1 จุด!", 3) end
+        running = true
+        currentPointIndex = 1
+        startWorking()
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "■ หยุดทำงาน (STOP)",
+    Callback = function()
+        running = false
+        updateStatus("หยุดการทำงานแล้ว")
+    end,
+})
+
+-- Config Tab
+ConfigTab:CreateSection("ตั้งค่าตัวละครและการกด E")
+
+ConfigTab:CreateSlider({
+    Name = "⚡ ความเร็วในการเดิน (WalkSpeed)",
+    Range = {16, 200},
+    Increment = 1,
+    CurrentValue = 16,
+    Callback = function(Value)
+        walkSpeed = Value
+        local char = player.Character
+        if char and char:FindFirstChildOfClass("Humanoid") then
+            char:FindFirstChildOfClass("Humanoid").WalkSpeed = Value
+        end
+    end,
+})
+
+ConfigTab:CreateInput({
+    Name = "⏱️ ระยะเวลารอก่อนกดปุ่ม (วินาที)",
+    PlaceholderText = "0.3",
+    Callback = function(Text) promptDelay = tonumber(Text) or 0.3 end,
+})
+
+ConfigTab:CreateToggle({
+    Name = "⚙️ ใช้เวลากดค้างแบบกำหนดเอง",
+    CurrentValue = false,
+    Callback = function(Value) overrideHoldDuration = Value end,
+})
+
+ConfigTab:CreateSlider({
+    Name = "⏳ ระยะเวลากดปุ่มค้าง (Hold Duration)",
+    Range = {0.1, 5},
+    Increment = 0.1,
+    CurrentValue = 0.5,
+    Callback = function(Value) customHoldTime = Value end,
+})
+
+-- Points Management Tab
+SettingsTab:CreateSection("📁 เลือกช่องไอเทม (หลังกด E เสร็จ)")
+
+SettingsTab:CreateDropdown({
+    Name = "🎒 เลือกช่องไอเทมที่ต้องการถือ",
+    Options = {"ไม่ถือ", "ช่องที่ 1", "ช่องที่ 2", "ช่องที่ 3", "ช่องที่ 4", "ช่องที่ 5", "ช่องที่ 6", "ช่องที่ 7", "ช่องที่ 8", "ช่องที่ 9"},
+    CurrentOption = {"ไม่ถือ"},
+    Callback = function(Option)
+        local choice = Option[1]
+        selectedSlot = choice == "ไม่ถือ" and 0 or (tonumber(choice:match("%d+")) or 0)
+    end,
+})
+
+SettingsTab:CreateSection("📁 เพิ่มและจัดการจุดพิกัด")
+
+SettingsTab:CreateButton({
+    Name = "➕ บันทึกจุดจากตำแหน่งที่ยืนอยู่ทันที",
+    Callback = function()
+        local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        if root then
+            local pos = root.Position
+            local x, y, z = math.floor(pos.X * 10) / 10, math.floor(pos.Y * 10) / 10, math.floor(pos.Z * 10) / 10
+
+            table.insert(points, { position = Vector3.new(x, y, z), waitTime = tempWait, slot = selectedSlot })
+            updateStatus("บันทึกจุดพิกัดใหม่แล้ว")
+            notify("บันทึกพิกัดสำเร็จ", string.format("จุดที่ %d: (%.1f, %.1f, %.1f)", #points, x, y, z), 3)
+        end
+    end,
+})
+
+SettingsTab:CreateButton({
+    Name = "📍 ดึงพิกัดปัจจุบันใส่ช่องด้านล่าง",
+    Callback = function()
+        local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        if root then
+            tempX = math.floor(root.Position.X * 10) / 10
+            tempY = math.floor(root.Position.Y * 10) / 10
+            tempZ = math.floor(root.Position.Z * 10) / 10
+            notify("ดึงพิกัดสำเร็จ", string.format("X: %.1f, Y: %.1f, Z: %.1f", tempX, tempY, tempZ), 3)
+        end
+    end,
+})
+
+SettingsTab:CreateInput({ Name = "พิกัด X", PlaceholderText = "X", Callback = function(T) tempX = tonumber(T) or tempX end })
+SettingsTab:CreateInput({ Name = "พิกัด Y", PlaceholderText = "Y", Callback = function(T) tempY = tonumber(T) or tempY end })
+SettingsTab:CreateInput({ Name = "พิกัด Z", PlaceholderText = "Z", Callback = function(T) tempZ = tonumber(T) or tempZ end })
+SettingsTab:CreateInput({ Name = "เวลารอหลังถึงจุด (วินาที)", PlaceholderText = "3", Callback = function(T) tempWait = tonumber(T) or 3 end })
+
+SettingsTab:CreateButton({
+    Name = "+ บันทึกจุดพิกัดจากช่องกรอก",
+    Callback = function()
+        table.insert(points, { position = Vector3.new(tempX, tempY, tempZ), waitTime = tempWait, slot = selectedSlot })
+        updateStatus("เพิ่มจุดพิกัดแล้ว")
+        notify("สำเร็จ", string.format("เพิ่มจุดที่ %d เรียบร้อยแล้ว", #points), 2)
+    end,
+})
+
+SettingsTab:CreateButton({
+    Name = "🗑️ ลบจุดพิกัดทั้งหมด",
+    Callback = function()
+        points = {}
+        currentPointIndex = 1
+        updateStatus("ลบจุดพิกัดทั้งหมดแล้ว")
+        notify("สำเร็จ", "ลบรายการจุดพิกัดทั้งหมดแล้ว", 2)
+    end,
+})
+
+-- Save / Load Tab
+SaveTab:CreateSection("ระบบจัดการไฟล์ตั้งค่า (Config)")
+
+SaveTab:CreateButton({ Name = "💾 บันทึกการตั้งค่า (Save Config)", Callback = saveConfig })
+SaveTab:CreateButton({ Name = "📂 โหลดการตั้งค่าที่บันทึกไว้ (Load Config)", Callback = loadConfig })
