@@ -1,0 +1,262 @@
+-- Services
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local running = false
+local loopEnabled = false
+local autoDepositEnabled = true
+local depositThreshold = 1000
+local points = {}
+local currentPointIndex = 1
+
+-- Settings
+local walkSpeed = 16
+local promptDelay = 0.3
+local customHoldTime = 0.5
+local overrideHoldDuration = false
+local fileName = "AutoWalk_Config.json"
+
+-- Load Rayfield Library
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local Window = Rayfield:CreateWindow({
+    Name = "ระบบเดินออโต้ + ฝากเงินอัตโนมัติ",
+    LoadingTitle = "Auto Walk Script",
+    LoadingSubtitle = "รองรับการฝากเงินและบันทึก Config",
+    ConfigurationSaving = { Enabled = false }
+})
+
+--========================
+-- Helper Functions
+--========================
+
+-- ค้นหาตัวเลขเงินสดจาก UI บนหน้าจอ (PlayerGui) และ leaderstats
+local function getPlayerCash()
+    local cashValue = 0
+
+    local playerGui = player:FindFirstChild("PlayerGui")
+    if playerGui then
+        for _, gui in ipairs(playerGui:GetDescendants()) do
+            if gui:IsA("TextLabel") or gui:IsA("TextBox") then
+                local text = gui.Text
+                if text:find("%$") or text:lower():find("cash") or text:lower():find("money") then
+                    local cleanNum = text:gsub("[^%d]", "")
+                    local num = tonumber(cleanNum)
+                    if num and num > cashValue then
+                        cashValue = num
+                    end
+                end
+            end
+        end
+    end
+
+    local stats = player:FindFirstChild("leaderstats") or player:FindFirstChild("Data") or player:FindFirstChild("stats")
+    if stats then
+        for _, child in ipairs(stats:GetChildren()) do
+            local name = child.Name:lower()
+            if name:find("cash") or name:find("money") or name:find("dollar") or name:find("wallet") then
+                local num = tonumber(child.Value)
+                if num and num > cashValue then
+                    cashValue = num
+                end
+            end
+        end
+    end
+
+    return cashValue
+end
+
+-- สั่งยิง Remote Event เพื่อฝากเงินเข้า ATM
+local function depositMoney(amount)
+    pcall(function()
+        local atmFolder = ReplicatedStorage:WaitForChild("ATM", 3)
+        if atmFolder then
+            local cashTransaction = atmFolder:WaitForChild("CashTransaction", 3)
+            if cashTransaction then
+                cashTransaction:FireServer(amount, "Deposit")
+                Rayfield:Notify({
+                    Title = "ฝากเงินสำเร็จ 💰", 
+                    Content = string.format("ฝากเงินจำนวน %d เรียบร้อย!", amount), 
+                    Duration = 2
+                })
+            end
+        end
+    end)
+end
+
+-- เช็คเงินและทำการฝาก
+local function checkAndDeposit()
+    if not autoDepositEnabled then return end
+    local currentCash = getPlayerCash()
+    if currentCash >= depositThreshold then
+        depositMoney(depositThreshold)
+        task.wait(1)
+    end
+end
+
+local function applyWalkSpeed(humanoid)
+    if humanoid then humanoid.WalkSpeed = walkSpeed end
+end
+
+local function equipSlot(slotNumber)
+    if not slotNumber or slotNumber < 1 or slotNumber > 9 then return end
+    local character = player.Character
+    local backpack = player:FindFirstChild("Backpack")
+    if character and backpack then
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        local items = backpack:GetChildren()
+        if humanoid and items[slotNumber] and items[slotNumber]:IsA("Tool") then
+            humanoid:EquipTool(items[slotNumber])
+        end
+    end
+end
+
+local function walkTo(position)
+    local character = player.Character or player.CharacterAdded:Wait()
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+
+    if not humanoid or not root then return false end
+    applyWalkSpeed(humanoid)
+
+    local path = PathfindingService:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })
+    local success = pcall(function() path:ComputeAsync(root.Position, position) end)
+
+    if not success or path.Status ~= Enum.PathStatus.Success then return false end
+
+    for _, waypoint in ipairs(path:GetWaypoints()) do
+        if not running then return false end
+        applyWalkSpeed(humanoid)
+        if waypoint.Action == Enum.PathWaypointAction.Jump then humanoid.Jump = true end
+        humanoid:MoveTo(waypoint.Position)
+        if not humanoid.MoveToFinished:Wait() then return false end
+    end
+    return true
+end
+
+local function findAndTriggerPrompt(position)
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") and obj.Enabled and obj.Parent and obj.Parent:IsA("BasePart") then
+            if (obj.Parent.Position - position).Magnitude < 12 then
+                task.wait(promptDelay)
+                local holdTime = overrideHoldDuration and customHoldTime or (obj.HoldDuration > 0 and (obj.HoldDuration + 0.1) or 0.1)
+                if fireproximityprompt then
+                    fireproximityprompt(obj)
+                else
+                    obj:InputHoldBegin()
+                    task.wait(holdTime)
+                    obj:InputHoldEnd()
+                end
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
+-- ระบบเช็คเงินตลอดเวลาเบื้องหลัง
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if running and autoDepositEnabled then
+            checkAndDeposit()
+        end
+    end
+end)
+
+-- Save / Load Functions
+local function saveConfig()
+    if not writefile then return end
+    local saveData = {
+        walkSpeed = walkSpeed, promptDelay = promptDelay, autoDepositEnabled = autoDepositEnabled,
+        depositThreshold = depositThreshold, pointsList = {}
+    }
+    for _, p in ipairs(points) do
+        table.insert(saveData.pointsList, { x = p.position.X, y = p.position.Y, z = p.position.Z, waitTime = p.waitTime, slot = p.slot })
+    end
+    writefile(fileName, HttpService:JSONEncode(saveData))
+    Rayfield:Notify({ Title = "สำเร็จ", Content = "บันทึกตั้งค่าลงไฟล์เรียบร้อยแล้ว", Duration = 2.5 })
+end
+
+local function loadConfig()
+    if not readfile or not isfile or not isfile(fileName) then return end
+    local success, result = pcall(function() return HttpService:JSONDecode(readfile(fileName)) end)
+    if success and result then
+        walkSpeed = result.walkSpeed or walkSpeed
+        depositThreshold = result.depositThreshold or depositThreshold
+        points = {}
+        if result.pointsList then
+            for _, p in ipairs(result.pointsList) do
+                table.insert(points, { position = Vector3.new(p.x, p.y, p.z), waitTime = p.waitTime or 3, slot = p.slot or 0 })
+            end
+        end
+        Rayfield:Notify({ Title = "สำเร็จ", Content = "โหลดจุดพิกัดเรียบร้อยแล้ว", Duration = 2.5 })
+    end
+end
+
+-- Main Execution
+local function startWorking()
+    if #points == 0 then return end
+    task.spawn(function()
+        while running do
+            for i = currentPointIndex, #points do
+                if not running then break end
+                currentPointIndex = i
+                local point = points[i]
+                
+                if walkTo(point.position) and running then
+                    findAndTriggerPrompt(point.position)
+                    task.wait(0.2)
+                    equipSlot(point.slot)
+                    checkAndDeposit()
+                    task.wait(point.waitTime)
+                end
+            end
+            if not loopEnabled or not running then break end
+            currentPointIndex = 1
+            task.wait(0.5)
+        end
+    end)
+end
+
+-- UI
+local MainTab = Window:CreateTab("หน้าหลัก", 4483362458)
+local SettingsTab = Window:CreateTab("จุดพิกัด", 4483362458)
+local SaveTab = Window:CreateTab("บันทึกข้อมูล", 4483362458)
+local selectedSlot = 0
+
+MainTab:CreateToggle({ Name = "🔁 เดินวนซ้ำตลอด", CurrentValue = false, Callback = function(v) loopEnabled = v end })
+MainTab:CreateToggle({ Name = "💰 ฝากเงินออโต้", CurrentValue = true, Callback = function(v) autoDepositEnabled = v end })
+MainTab:CreateInput({ Name = "💵 ขั้นต่ำเงินที่จะฝาก", PlaceholderText = "1000", Callback = function(t) depositThreshold = tonumber(t) or 1000 end })
+MainTab:CreateButton({ Name = "▶ เริ่มทำงาน (START)", Callback = function() if not running then running = true currentPointIndex = 1 startWorking() end end })
+MainTab:CreateButton({ Name = "■ หยุดทำงาน (STOP)", Callback = function() running = false end })
+
+SettingsTab:CreateDropdown({
+    Name = "สลับถือช่องไอเทมหลังกด E",
+    Options = {"ไม่ถือ", "ช่อง 1", "ช่อง 2", "ช่อง 3", "ช่อง 4", "ช่อง 5", "ช่อง 6", "ช่อง 7", "ช่อง 8", "ช่อง 9"},
+    CurrentOption = {"ไม่ถือ"},
+    Callback = function(Option)
+        local choice = Option[1]
+        selectedSlot = choice == "ไม่ถือ" and 0 or (tonumber(choice:match("%d+")) or 0)
+    end
+})
+
+SettingsTab:CreateButton({
+    Name = "➕ เซฟจุดที่ยืนอยู่ทันที",
+    Callback = function()
+        local char = player.Character
+        if char and char:FindFirstChild("HumanoidRootPart") then
+            local pos = char.HumanoidRootPart.Position
+            table.insert(points, { position = Vector3.new(pos.X, pos.Y, pos.Z), waitTime = 3, slot = selectedSlot })
+            Rayfield:Notify({ Title = "บันทึกสำเร็จ", Content = "เพิ่มจุดที่ " .. #points .. " เรียบร้อย!", Duration = 2 })
+        end
+    end
+})
+
+SettingsTab:CreateButton({ Name = "🗑️ ลบจุดทั้งหมด", Callback = function() points = {} Rayfield:Notify({ Title = "ลบสำเร็จ", Content = "ลบจุดพิกัดทั้งหมดแล้ว", Duration = 2 }) end })
+
+SaveTab:CreateButton({ Name = "💾 บันทึกตั้งค่า (Save Config)", Callback = saveConfig })
+SaveTab:CreateButton({ Name = "📂 โหลดตั้งค่า (Load Config)", Callback = loadConfig })
